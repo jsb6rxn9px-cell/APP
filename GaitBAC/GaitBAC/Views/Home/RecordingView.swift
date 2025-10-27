@@ -1,87 +1,66 @@
+//
+//  CountdownView.swift
+//  GaitBAC
+//
+
 import SwiftUI
 
-struct RecordingView: View {
+struct CountdownView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var app: AppState
     let meta: SessionMeta
-    let goDate: Date
 
-    @State private var showSummary = false
-    @State private var showingFinishOverlay = false
+    @State private var counter = 3
+    @State private var goDate = Date()
+    @State private var showRecording = false
+    @State private var timer: Timer?
 
     var body: some View {
-        ZStack {
-            VStack(spacing: 16) {
-                HStack {
-                    Text("Enregistrement").font(.title2).bold()
-                    Spacer()
-                    badge
-                }
-
-                ProgressView(value: min(app.recorder.elapsed / Double(meta.duration_target_s), 1.0))
-                    .tint(.blue)
-                    .padding(.vertical)
-
-                HStack {
-                    LabeledValue(title: "t (s)", value: String(format: "%.1f", app.recorder.elapsed))
-                    LabeledValue(title: "Hz", value: String(format: "%.0f", app.recorder.measuredHz))
-                    LabeledValue(title: "|a|", value: String(format: "%.2f", app.recorder.avgAccelNorm))
-                    LabeledValue(title: "cadence", value: String(format: "%.0f", app.recorder.estCadenceSpm))
-                }
-
-                Spacer(minLength: 0)
-                Text("L’enregistrement se termine automatiquement à \(meta.duration_target_s) s.")
-                    .font(.footnote).foregroundStyle(.secondary)
-            }
-            .padding()
-            .onAppear { UIApplication.shared.isIdleTimerDisabled = true }
-            .onDisappear { UIApplication.shared.isIdleTimerDisabled = false }
-
-            if showingFinishOverlay {
-                Color.black.opacity(0.35).ignoresSafeArea()
-                VStack(spacing: 12) {
-                    ProgressView()
-                    Text("Fin du test… préparation du résumé")
-                        .font(.callout).foregroundStyle(.white)
-                }
-            }
-        }
-        // RecordingView.swift — remplace les deux .onChange par ceci
-        .onReceive(app.recorder.$state.removeDuplicates()) { s in
-            guard s == .finished, !showSummary else { return }
-            showingFinishOverlay = true
-            // petit délai pour éviter "modifying state during view update"
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                showSummary = true
-            }
-        }
-
-        // garde-fou temps (si jamais .finished n’arrive pas)
-        .onReceive(app.recorder.$elapsed) { v in
-            if v >= Double(meta.duration_target_s), app.recorder.state != .finished, !showSummary {
-                showingFinishOverlay = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { showSummary = true }
-            }
-        }
-        .fullScreenCover(isPresented: $showSummary, onDismiss: {
-            showingFinishOverlay = false
-            dismiss()
-        }) {
-            SummaryView(meta: meta) {
-                showingFinishOverlay = false
-                showSummary = false
+        VStack(spacing: 16) {
+            Text("Get ready…").font(.headline)
+            Text("\(max(0, counter))").font(.system(size: 96, weight: .black, design: .rounded))
+            Text("Place the phone (\(meta.position.rawValue)). Stay still until GO.")
+                .multilineTextAlignment(.center).padding()
+            Button("Cancel", role: .cancel) {
+                timer?.invalidate(); timer = nil
                 dismiss()
             }
-            .environmentObject(app)
+        }
+        .onAppear {
+            app.recorder.prepare(
+                targetHz: meta.sampling_hz_target,
+                durationSec: 0,
+                prerollSec: 0,
+                beeps: app.settings.beeps,
+                haptics: false
+            )
+            if app.settings.beeps { AudioManager.activateSession() }
+            startCountdown()
+        }
+        .onDisappear {
+            timer?.invalidate(); timer = nil
+            AudioManager.deactivateSession()
+        }
+        .fullScreenCover(isPresented: $showRecording) {
+            RecordingView(meta: meta, goDate: goDate).environmentObject(app)
         }
     }
 
-    @ViewBuilder private var badge: some View {
-        switch app.recorder.state {
-        case .recording: Label("REC", systemImage: "dot.circle.fill").foregroundStyle(.red)
-        case .paused:    Label("PAUSE", systemImage: "pause.circle").foregroundStyle(.orange)
-        case .finished:  Label("FINI", systemImage: "checkmark.circle").foregroundStyle(.green)
-        default:         EmptyView()
+    private func startCountdown() {
+        counter = 3
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { t in
+            if counter > 0 {
+                if app.settings.beeps { AudioManager.beepShort() }
+                counter -= 1
+            } else {
+                if app.settings.beeps { AudioManager.beepLongGo() }
+                goDate = Date()
+                app.recorder.startRecording(withGoAt: goDate)
+                t.invalidate()
+                showRecording = true
+            }
         }
+        RunLoop.main.add(timer!, forMode: .common)
     }
 }
