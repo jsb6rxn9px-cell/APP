@@ -2,24 +2,25 @@
 //  MotionRecorder.swift
 //  GaitBAC
 //
-//  Created by Hugo Roy-Poulin on 2025-09-15.
-//
 
 import Foundation
 import SwiftUI
 import CoreMotion
+import AVFoundation
 import UIKit
 
 final class MotionRecorder: ObservableObject {
+
     enum State { case idle, countingDown, recording, paused, finished }
 
-    // Toutes ces propriétés seront mises à jour sur le MAIN
+    // Published on main thread only
     @Published var state: State = .idle
     @Published var measuredHz: Double = 0
     @Published var avgAccelNorm: Double = 0
     @Published var estCadenceSpm: Double = 0
     @Published var elapsed: Double = 0
 
+    // Config / runtime
     private let motion = CMMotionManager()
     private let motionQueue: OperationQueue = {
         let q = OperationQueue()
@@ -30,108 +31,95 @@ final class MotionRecorder: ObservableObject {
     }()
 
     private var samples: [SensorSample] = []
-    private var tBaseline: TimeInterval?
-
+    private var t0Sample: TimeInterval?        // time of first sample (relative)
     private var targetHz: Int = 100
-    private var durationSec: Int = 30
     private var beeps: Bool = true
-    private var haptics: Bool = true
 
+    // Timers
     private var displayLink: CADisplayLink?
-    private var safetyStopWorkItem: DispatchWorkItem?
+    private var capTimer: DispatchSourceTimer?
+    private var tick30sTimer: DispatchSourceTimer?
 
+    // Rolling stats
     private var accelNormWindow: [Double] = []
     private var timeWindow: [Double] = []
 
+    // Constants
+    private let capSeconds: Int = 360 // 6 minutes hard cap
+
     // MARK: - Public API
 
-    func prepare(targetHz: Int, durationSec: Int, prerollSec: Double = 2.0, beeps: Bool, haptics: Bool) {
+    /// Prepare for a new session. Duration is deprecated (kept for back-compat).
+    func prepare(targetHz: Int, durationSec: Int = 0, prerollSec: Double = 2.0, beeps: Bool = true, haptics _: Bool = false) {
         self.targetHz = targetHz
-        self.durationSec = durationSec
         self.beeps = beeps
-        self.haptics = haptics
 
-        // Reset côté MAIN
+        // Reset on main
         DispatchQueue.main.async {
             self.samples.removeAll(keepingCapacity: true)
-            self.tBaseline = nil
+            self.t0Sample = nil
             self.measuredHz = 0
             self.avgAccelNorm = 0
             self.estCadenceSpm = 0
             self.elapsed = 0
             self.accelNormWindow.removeAll()
             self.timeWindow.removeAll()
+            self.invalidateAllTimers()
             self.state = .idle
         }
     }
 
+    /// Start device motion acquisition. `withGoAt` kept for compatibility (not used internally).
     func startRecording(withGoAt _: Date) {
         guard motion.isDeviceMotionAvailable else { return }
 
+        // Begin recording
         DispatchQueue.main.async { self.state = .recording }
 
-        samples.removeAll(keepingCapacity: true)
-        tBaseline = nil
-        accelNormWindow.removeAll()
-        timeWindow.removeAll()
-
-        motion.deviceMotionUpdateInterval = 1.0 / Double(targetHz)
-
-        // Handler sur queue dédiée, mais on PUBLIE sur MAIN
-        motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: motionQueue) { [weak self] dm, error in
+        // Configure and start motion updates
+        motion.deviceMotionUpdateInterval = 1.0 / Double(max(1, targetHz))
+        motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: motionQueue) { [weak self] dm, err in
             guard let self = self else { return }
-
             if let dm {
-                // Calculs rapides en background
                 let sample = self.makeSample(from: dm)
                 let norm = self.magnitude(ax: sample.ax, ay: sample.ay, az: sample.az)
-                let t = sample.t
 
-                // Publication sur le MAIN (samples, elapsed, stats, etc.)
+                // Main thread publication
                 DispatchQueue.main.async {
-                    // Si on a quitté l’enregistrement entre-temps, ignorer
                     guard self.state == .recording || self.state == .paused else { return }
-
+                    if self.t0Sample == nil { self.t0Sample = sample.t }
                     self.samples.append(sample)
 
-                    // Stats live (fenêtre 5 s)
+                    // Live stats with a 5s window
+                    self.timeWindow.append(sample.t)
                     self.accelNormWindow.append(norm)
-                    self.timeWindow.append(t)
-                    while let first = self.timeWindow.first, t - first > 5 {
+                    while let first = self.timeWindow.first, sample.t - first > 5 {
                         _ = self.timeWindow.removeFirst()
                         _ = self.accelNormWindow.removeFirst()
                     }
-                    self.avgAccelNorm = self.accelNormWindow.reduce(0, +) / max(1, Double(self.accelNormWindow.count))
+                    let count = max(1, self.accelNormWindow.count)
+                    self.avgAccelNorm = self.accelNormWindow.reduce(0, +) / Double(count)
                     self.estCadenceSpm = self.estimateCadenceSPM(times: self.timeWindow, values: self.accelNormWindow)
 
-                    self.elapsed = t
-
-                    // Arrêt immédiat au-delà de la durée
-                    if t >= Double(self.durationSec), self.state == .recording {
-                        self._stopRecordingMain()
-                    }
+                    // Precise elapsed from first sample
+                    self.elapsed = max(0, sample.t - (self.t0Sample ?? sample.t))
                 }
-            } else if error != nil {
-                DispatchQueue.main.async {
-                    self._stopRecordingMain()
-                }
+            } else if err != nil {
+                DispatchQueue.main.async { self._stopRecordingMain() }
             }
         }
 
-        startElapsedTimer()
+        // UI elapsed updater
+        startElapsedDisplayLink()
 
-        // Garde-fou : durée + 5 s
-        safetyStopWorkItem?.cancel()
-        let wi = DispatchWorkItem { [weak self] in
-            guard let self, self.state == .recording else { return }
-            self._stopRecordingMain()
-        }
-        safetyStopWorkItem = wi
-        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(durationSec + 5), execute: wi)
+        // 6-minute cap
+        scheduleCapTimer()
+
+        // 30s tick beeps (non-blocking)
+        schedule30sTicks()
     }
 
     func stopRecording() {
-        // Toujours arrêter côté MAIN
         if Thread.isMainThread { _stopRecordingMain() }
         else { DispatchQueue.main.async { self._stopRecordingMain() } }
     }
@@ -139,7 +127,7 @@ final class MotionRecorder: ObservableObject {
     func pause() {
         guard state == .recording else { return }
         motion.stopDeviceMotionUpdates()
-        stopElapsedTimer()
+        stopElapsedDisplayLink()
         DispatchQueue.main.async { self.state = .paused }
     }
 
@@ -147,29 +135,33 @@ final class MotionRecorder: ObservableObject {
         guard state == .paused else { return }
         DispatchQueue.main.async { self.state = .recording }
 
-        motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: motionQueue) { [weak self] dm, error in
+        motion.deviceMotionUpdateInterval = 1.0 / Double(max(1, targetHz))
+        motion.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: motionQueue) { [weak self] dm, err in
             guard let self = self else { return }
             if let dm {
                 let sample = self.makeSample(from: dm)
                 let norm = self.magnitude(ax: sample.ax, ay: sample.ay, az: sample.az)
-                let t = sample.t
+
                 DispatchQueue.main.async {
                     guard self.state == .recording else { return }
+                    if self.t0Sample == nil { self.t0Sample = sample.t }
                     self.samples.append(sample)
-                    self.accelNormWindow.append(norm); self.timeWindow.append(t)
-                    while let first = self.timeWindow.first, t - first > 5 {
-                        _ = self.timeWindow.removeFirst(); _ = self.accelNormWindow.removeFirst()
+                    self.timeWindow.append(sample.t)
+                    self.accelNormWindow.append(norm)
+                    while let first = self.timeWindow.first, sample.t - first > 5 {
+                        _ = self.timeWindow.removeFirst()
+                        _ = self.accelNormWindow.removeFirst()
                     }
-                    self.avgAccelNorm = self.accelNormWindow.reduce(0, +) / max(1, Double(self.accelNormWindow.count))
+                    self.avgAccelNorm = self.accelNormWindow.reduce(0, +) / Double(max(1, self.accelNormWindow.count))
                     self.estCadenceSpm = self.estimateCadenceSPM(times: self.timeWindow, values: self.accelNormWindow)
-                    self.elapsed = t
+                    self.elapsed = max(0, sample.t - (self.t0Sample ?? sample.t))
                 }
-            } else if error != nil {
+            } else if err != nil {
                 DispatchQueue.main.async { self._stopRecordingMain() }
             }
         }
 
-        startElapsedTimer()
+        startElapsedDisplayLink()
     }
 
     func export(meta: SessionMeta, settings: AppSettings) -> (URL, QualitySummary)? {
@@ -186,73 +178,90 @@ final class MotionRecorder: ObservableObject {
         }
     }
 
-    // Pour reset total (utilisé lors des retours Home/Consent)
     func discard() {
-        motion.stopDeviceMotionUpdates()
-        stopElapsedTimer()
-        safetyStopWorkItem?.cancel(); safetyStopWorkItem = nil
-
         DispatchQueue.main.async {
-            self.samples.removeAll()
-            self.tBaseline = nil
-            self.measuredHz = 0
-            self.avgAccelNorm = 0
-            self.estCadenceSpm = 0
+            self.motion.stopDeviceMotionUpdates()
+            self.invalidateAllTimers()
+            self.samples.removeAll(keepingCapacity: true)
+            self.t0Sample = nil
             self.elapsed = 0
             self.state = .idle
         }
     }
 
-    // MARK: - Private (MAIN-safe)
+    // MARK: - Internals
 
     private func _stopRecordingMain() {
-        // Toujours MAIN ici
         motion.stopDeviceMotionUpdates()
-        stopElapsedTimer()
-        safetyStopWorkItem?.cancel(); safetyStopWorkItem = nil
+        invalidateAllTimers()
 
         if samples.count > 1 {
             let t0 = samples.first!.t, tN = samples.last!.t
             let dur = max(tN - t0, 1e-6)
             measuredHz = Double(samples.count - 1) / dur
+            elapsed = dur
         }
         state = .finished
         print("[Recorder] finished - samples=\(samples.count) measuredHz=\(measuredHz)")
-        if haptics { UINotificationFeedbackGenerator().notificationOccurred(.success) }
-        
-        
     }
 
-    private func startElapsedTimer() {
+    private func startElapsedDisplayLink() {
         DispatchQueue.main.async {
             self.displayLink?.invalidate()
-            self.displayLink = CADisplayLink(target: self, selector: #selector(self.tick))
+            self.displayLink = CADisplayLink(target: self, selector: #selector(self._uiTick))
             self.displayLink?.add(to: .main, forMode: .common)
         }
     }
 
-    private func stopElapsedTimer() {
+    private func stopElapsedDisplayLink() {
         DispatchQueue.main.async {
             self.displayLink?.invalidate()
             self.displayLink = nil
         }
     }
 
-    @objc private func tick() {
-        // elapsed déjà mis à jour côté MAIN par le handler;
-        // garde-fou ici au cas où
-        if elapsed >= Double(durationSec), state == .recording {
-            _stopRecordingMain()
+    @objc private func _uiTick() {
+        // Elapsed is updated from samples; no-op here to keep DisplayLink alive for UI refresh
+    }
+
+    private func scheduleCapTimer() {
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .seconds(capSeconds))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.state == .recording else { return }
+            self._stopRecordingMain()
         }
+        capTimer = timer
+        timer.resume()
+    }
+
+    private func schedule30sTicks() {
+        guard beeps else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        // Start at next 30s boundary: 30, 60, ..., 360
+        timer.schedule(deadline: .now() + .seconds(30), repeating: .seconds(30))
+        timer.setEventHandler {
+            // Only while recording; last tick at 6:00 inclusive
+            if self.state == .recording {
+                AudioManager.beepShort()
+            }
+        }
+        tick30sTimer = timer
+        timer.resume()
+    }
+
+    private func invalidateAllTimers() {
+        displayLink?.invalidate(); displayLink = nil
+        capTimer?.cancel(); capTimer = nil
+        tick30sTimer?.cancel(); tick30sTimer = nil
     }
 
     private func makeSample(from dm: CMDeviceMotion) -> SensorSample {
-        if tBaseline == nil { tBaseline = dm.timestamp }
-        let t = dm.timestamp - (tBaseline ?? dm.timestamp)
         let a = dm.userAcceleration
-        let g = dm.gravity
         let r = dm.rotationRate
         let q = dm.attitude.quaternion
+        let g = dm.gravity
+        let t = dm.timestamp // seconds since boot (monotonic)
         return SensorSample(
             t: t,
             ax: a.x, ay: a.y, az: a.z,
@@ -285,7 +294,7 @@ final class MotionRecorder: ObservableObject {
             if dt > 1.5 * expectedDt { dropped += max(0, slots - 1) }
             lastT = samples[i].t
         }
-        let droppedPct = totalSlots > 0 ? 100.0 * Double(dropped) / Double(totalSlots) : 0
+        let droppedPct = totalSlots > 0 ? (100.0 * Double(dropped) / Double(totalSlots)) : 0.0
 
         let norms = samples.map { sqrt($0.ax*$0.ax + $0.ay*$0.ay + $0.az*$0.az) }
         let median = norms.sorted()[norms.count/2]
@@ -297,28 +306,25 @@ final class MotionRecorder: ObservableObject {
         if droppedPct > 2.0 { score = "Attention" }
         if !(0.5...3.0).contains(median) { score = "Attention" }
         if cadence != 0, !(80...140).contains(cadence) { score = "Attention" }
+
         return .init(measuredHz: measured, droppedPct: droppedPct, durationReal: dur,
                      cadenceSpm: cadence == 0 ? nil : cadence, accelMedianNorm: median, score: score)
     }
 
+    /// Very-light cadence estimate from a magnitude stream (placeholder; same as your original heuristic)
     private func estimateCadenceSPM(times: [Double], values: [Double]) -> Double {
-        guard times.count > 8 else { return 0 }
-        let mean = values.reduce(0, +) / Double(values.count)
-        let variance = values.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(values.count)
-        let std = sqrt(max(1e-9, variance))
-        let z = values.map { ($0 - mean) / max(std, 1e-6) }
-
-        var lastPeakT = times.first ?? 0
-        var peaks: [Double] = []
-        for i in 1..<(z.count - 1) {
-            if z[i] > 0.8 && z[i] > z[i-1] && z[i] > z[i+1] {
-                let t = times[i]
-                if t - lastPeakT > 0.30 { peaks.append(t); lastPeakT = t }
-            }
+        guard times.count > 8, values.count == times.count else { return 0 }
+        // Zero-crossing-like rough estimate: count peaks above median+std within a sliding window
+        let n = values.count
+        let mean = values.reduce(0,+)/Double(n)
+        let std = sqrt(values.map{ ($0 - mean)*($0 - mean) }.reduce(0,+)/Double(n))
+        let th = mean + 0.5*std
+        var peaks = 0
+        for i in 1..<(n-1) {
+            if values[i] > th && values[i] > values[i-1] && values[i] > values[i+1] { peaks += 1 }
         }
-        guard peaks.count >= 2 else { return 0 }
-        let intervals = zip(peaks.dropFirst(), peaks).map { $0 - $1 }
-        let medianISI = intervals.sorted()[intervals.count/2]
-        return 60.0 / max(medianISI, 1e-6)
+        let duration = max(1e-6, (times.last! - times.first!))
+        let stepsPerSec = Double(peaks)/duration
+        return stepsPerSec * 60.0
     }
 }

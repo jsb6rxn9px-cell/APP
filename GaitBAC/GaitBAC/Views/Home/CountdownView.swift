@@ -2,8 +2,6 @@
 //  CountdownView.swift
 //  GaitBAC
 //
-//  Created by Hugo Roy-Poulin on 2025-09-15.
-//
 
 import SwiftUI
 
@@ -12,42 +10,36 @@ struct CountdownView: View {
     @EnvironmentObject var app: AppState
     let meta: SessionMeta
 
-    @State private var counter = 10
+    @State private var counter = 3
     @State private var goDate = Date()
     @State private var showRecording = false
+    @State private var timer: Timer?
 
     var body: some View {
         VStack(spacing: 16) {
-            Text("Préparation…").font(.headline)
-            Text("\(counter)").font(.system(size: 96, weight: .black, design: .rounded))
-            Text("Placez le téléphone (\(meta.position.rawValue)). Restez immobile jusqu’au GO.")
+            Text("Get ready…").font(.headline)
+            Text("\(max(0, counter))").font(.system(size: 96, weight: .black, design: .rounded))
+            Text("Place the phone (\(meta.position.rawValue)). Stay still until GO.")
                 .multilineTextAlignment(.center).padding()
-            Button("Annuler", role: .cancel) { dismiss() }
+            Button("Cancel", role: .cancel) {
+                timer?.invalidate(); timer = nil
+                dismiss()
+            }
         }
         .onAppear {
             app.recorder.prepare(
                 targetHz: meta.sampling_hz_target,
-                durationSec: meta.duration_target_s,
-                prerollSec: meta.preroll_s,
+                durationSec: 0,
+                prerollSec: 0,
                 beeps: app.settings.beeps,
-                haptics: app.settings.haptics
+                haptics: false
             )
             if app.settings.beeps { AudioManager.activateSession() }
             startCountdown()
         }
-        .onDisappear { AudioManager.deactivateSession() }
-        .onChange(of: counter) { _, newValue in
-            if [3,2,1].contains(newValue) {
-                if app.settings.haptics { UIImpactFeedbackGenerator(style: .rigid).impactOccurred() }
-                if app.settings.beeps { AudioManager.beepCount() }
-            }
-            if newValue == 0 {
-                if app.settings.haptics { UINotificationFeedbackGenerator().notificationOccurred(.success) }
-                if app.settings.beeps { AudioManager.beepGo() }
-                goDate = Date()
-                app.recorder.startRecording(withGoAt: goDate)
-                showRecording = true
-            }
+        .onDisappear {
+            timer?.invalidate(); timer = nil
+            AudioManager.deactivateSession()
         }
         .fullScreenCover(isPresented: $showRecording) {
             RecordingView(meta: meta, goDate: goDate).environmentObject(app)
@@ -55,10 +47,20 @@ struct CountdownView: View {
     }
 
     private func startCountdown() {
-        counter = 10
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { t in
-            counter -= 1
-            if counter <= 0 { t.invalidate() }
+        counter = 3
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { t in
+            if counter > 0 {
+                if app.settings.beeps { AudioManager.beepShort() }
+                counter -= 1
+            } else {
+                if app.settings.beeps { AudioManager.beepLongGo() }
+                goDate = Date()
+                app.recorder.startRecording(withGoAt: goDate)
+                t.invalidate()
+                showRecording = true
+            }
         }
+        RunLoop.main.add(timer!, forMode: .common)
     }
 }
